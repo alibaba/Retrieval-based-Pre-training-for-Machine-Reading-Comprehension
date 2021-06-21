@@ -1,0 +1,488 @@
+import argparse
+import json
+from collections import Counter
+from functools import partial
+from typing import List, Dict
+import sys
+import os
+import logging
+
+import nltk
+import numpy as np
+import torch
+import random
+from multiprocessing import Pool
+from tqdm import tqdm
+from transformers import PreTrainedTokenizer, AutoTokenizer, RobertaTokenizer, BertTokenizer
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+
+
+from oss_utils import torch_save_to_oss, set_bucket_dir
+
+
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+                    datefmt='%m/%d/%Y %H:%M:%S',
+                    level=logging.INFO)
+logger = logging.getLogger(f'fangxi.{__name__}')
+
+
+"""
+Converting like processor `wiki_pre_train_ent_mp`.
+"""
+
+
+def generate_pre_sent_id(example, offset):
+    question = example['question']
+    passage = example['passage']
+
+    true_id2rank = {
+        s['index']: idx for idx, s in enumerate(question + passage)
+    }
+
+    pre_idx = []
+    for _q_sent in question:
+        q_sent_id = _q_sent['index']
+        pre_sent_id = q_sent_id + offset
+        if pre_sent_id < 0 or pre_sent_id >= len(true_id2rank):
+            pre_idx.append(-1)
+        else:
+            pre_idx.append(true_id2rank[pre_sent_id])
+    return pre_idx
+
+
+def get_sentence_spans(token_tuple, _start_offset, _sent_id_map, _sentence_spans):
+    ini_sent_ids, ini_tokens = zip(*token_tuple)
+    ini_sent_ids = Counter(ini_sent_ids)
+    sorted_ini_sent_ids = sorted(
+        ini_sent_ids.items(), key=lambda x: x[0])
+
+    _start_offset = _start_offset
+    for ini_s_id, s_len in sorted_ini_sent_ids:
+        _new_t_s = _start_offset
+        _new_t_e = _start_offset + s_len - 1
+        _start_offset = _new_t_e + 1
+        _sent_id_map[ini_s_id] = len(_sentence_spans)
+        _sentence_spans.append((_new_t_s, _new_t_e))
+
+    return ini_tokens
+
+
+def process_example(example, max_seq_length, if_add_lm, if_bpe):
+
+    true_idx2ini_idx_map = {}
+    truncated = 0
+
+    pre_sent_ids = generate_pre_sent_id(example, -1)
+    example['pre_sent_ids'] = pre_sent_ids
+
+    nn_sent_ids = generate_pre_sent_id(example, 2)
+    example['nn_sent_ids'] = nn_sent_ids
+
+    pp_sent_ids = generate_pre_sent_id(example, -2)
+    example['pp_sent_ids'] = pp_sent_ids
+
+    q_tokens = []
+    for sent_id, q_sent in enumerate(example['question']):
+        true_idx = q_sent['index']
+        true_idx2ini_idx_map[true_idx] = sent_id
+
+        q_text = q_sent['text']
+
+        if sent_id > 0 and if_bpe:
+            sub_words = tokenizer.tokenize(q_text, add_prefix_space=True)
+        else:
+            sub_words = tokenizer.tokenize(q_text)
+
+        if len(sub_words) == 0:
+            logger.warning(f"Found empty sentence in question: {q_sent['text']}")
+
+        q_tokens.extend([(sent_id, t) for t in sub_words])
+
+    q_sent_num = len(example['question'])
+
+    d_tokens = []
+    for sent_id, d_sent in enumerate(example['passage']):
+        true_idx = d_sent['index']
+        true_idx2ini_idx_map[true_idx] = sent_id + q_sent_num
+
+        d_text = d_sent['text']
+
+        if sent_id > 0 and if_bpe:
+            sub_words = tokenizer.tokenize(d_text, add_prefix_space=True)
+        else:
+            sub_words = tokenizer.tokenize(d_text)
+
+        if len(sub_words) == 0:
+            logger.warn(
+                f"Found empty sentence in passage: {d_sent['text']}")
+
+        d_tokens.extend([(q_sent_num + sent_id, t) for t in sub_words])
+
+    tmp = len(q_tokens) + len(d_tokens)
+
+    # lens_to_remove = tmp + 4 - max_seq_length  # roberta == 4
+    if if_bpe:
+        lens_to_remove = tmp + 4 - max_seq_length
+    else:
+        lens_to_remove = tmp + 3 - max_seq_length
+
+    _q_tokens, _d_tokens, _ = tokenizer.truncate_sequences(q_tokens,
+                                                           pair_ids=d_tokens,
+                                                           num_tokens_to_remove=lens_to_remove,
+                                                           truncation_strategy='longest_first')
+
+    if len(_q_tokens) + len(_d_tokens) < tmp:
+        # logger.warn("Truncation has occurred in example index: {}".format(str(example_index)))
+        truncated += 1
+
+    sent_id_map = {}
+    sentence_spans = []
+    start_offset = 1  # Offset for cls_token
+    # question
+    ini_q_tokens = get_sentence_spans(_q_tokens, start_offset,
+                                      sent_id_map, sentence_spans)
+
+    start_offset = len(ini_q_tokens) + (3 if if_bpe else 2)
+
+    q_sent_num = len(sentence_spans)
+
+    # passage
+    ini_p_tokens = get_sentence_spans(_d_tokens, start_offset,
+                                      sent_id_map, sentence_spans)
+    assert len(sentence_spans) > 0
+    # print(len(ini_q_tokens), len(ini_p_tokens))
+
+    tokenizer_outputs = tokenizer.encode_plus(ini_q_tokens, text_pair=ini_p_tokens,
+                                              padding='max_length', max_length=max_seq_length)
+
+    input_ids = tokenizer_outputs['input_ids']
+    if 'token_type_ids' in tokenizer_outputs:
+        token_type_ids = tokenizer_outputs['token_type_ids']
+    else:
+        token_type_ids = [0]
+    attention_mask = tokenizer_outputs['attention_mask']
+
+    if if_add_lm:
+        cleaned_q_tokens = []
+        for _idx, _tmp in enumerate(example['question']):
+            if if_bpe:
+                extra_args = {"add_prefix_space": _idx > 0}
+            else:
+                extra_args = {}
+
+            cleaned_q_tokens.extend(
+                tokenizer.tokenize(_tmp['text'], **extra_args)
+            )
+        # Consistency check
+        if len(cleaned_q_tokens) != len(q_tokens):
+            # logger.warning("Consistency checking in question failed.")
+            return None
+
+        cleaned_d_tokens = []
+        for _idx, _tmp in enumerate(example['passage']):
+            if if_bpe:
+                extra_args = {"add_prefix_space": _idx > 0}
+            else:
+                extra_args = {}
+
+            cleaned_d_tokens.extend(
+                tokenizer.tokenize(_tmp['text'], **extra_args)
+            )
+        
+        # consistency check
+        if len(d_tokens) != len(cleaned_d_tokens):
+            logger.warning("Consistency checking in document failed.")
+            return None
+
+        cleaned_tk_outputs = tokenizer.encode_plus(cleaned_q_tokens, text_pair=cleaned_d_tokens,
+                                                   padding='max_length', max_length=max_seq_length,
+                                                   truncation='longest_first')
+
+        mlm_ids = cleaned_tk_outputs['input_ids']
+        assert len(mlm_ids) == len(input_ids), (
+            len(mlm_ids),
+            len(input_ids)
+            # tokenizer.convert_ids_to_tokens(mlm_ids),
+            # tokenizer.convert_ids_to_tokens(input_ids)
+        )
+
+        for seq_idx in range(len(input_ids)):
+            if mlm_ids[seq_idx] == input_ids[seq_idx]:
+                mlm_ids[seq_idx] = -1
+
+        assert sum(mlm_ids) == -1 * len(input_ids)
+
+    answer = []
+    q_answer = 0
+    p_answer = 0
+    tot_answer = 0
+    for q_id, tgt in enumerate(example['answer']):
+
+        if q_id not in sent_id_map:
+            continue
+        assert sent_id_map[q_id] == len(
+            answer), (q_id, sent_id_map[q_id], len(answer))
+
+        if tgt not in sent_id_map:
+            answer.append(-1)
+        else:
+            tot_answer += 1
+            _ans = sent_id_map[tgt]
+            answer.append(_ans)
+            if _ans < q_sent_num:
+                q_answer += 1
+            else:
+                p_answer += 1
+
+    pre_answer = []
+    q_pre_answer = 0
+    p_pre_answer = 0
+    tot_pre_answer = 0
+    for q_id, tgt in enumerate(example['pre_sent_ids']):
+        if q_id not in sent_id_map:
+            continue
+
+        if tgt not in sent_id_map:
+            pre_answer.append(-1)
+        else:
+            _ans = sent_id_map[tgt]
+            pre_answer.append(_ans)
+            tot_pre_answer += 1
+            if _ans < q_sent_num:
+                q_pre_answer += 1
+            else:
+                p_pre_answer += 1
+
+    nn_answer = []
+    for q_id, tgt in enumerate(example['nn_sent_ids']):
+        if q_id not in sent_id_map:
+            continue
+
+        if tgt not in sent_id_map:
+            nn_answer.append(-1)
+        else:
+            nn_answer.append(sent_id_map[tgt])
+
+    pp_answer = []
+    for q_id, tgt in enumerate(example['pp_sent_ids']):
+        if q_id not in sent_id_map:
+            continue
+
+        if tgt not in sent_id_map:
+            pp_answer.append(-1)
+        else:
+            pp_answer.append(sent_id_map[tgt])
+
+    assert len(answer) == len(pre_answer) == len(
+        nn_answer) == len(pp_answer)
+
+    assert len(input_ids) == max_seq_length
+    assert len(attention_mask) == max_seq_length
+    if 'token_type_ids' in tokenizer_outputs:
+        assert len(token_type_ids) == max_seq_length
+
+    true_idx2ini_idx_tuples = sorted(
+        true_idx2ini_idx_map.items(), key=lambda x: x[0])
+    cleaned_idx = []
+    for i, (true_idx, ini_idx) in enumerate(true_idx2ini_idx_tuples):
+        assert i == true_idx
+        if ini_idx in sent_id_map:
+            cleaned_idx.append(sent_id_map[ini_idx])
+    assert len(cleaned_idx) == len(sentence_spans)
+
+    return {
+        "input_ids": input_ids,
+        "token_type_ids": token_type_ids,
+        "attention_mask": attention_mask,
+        "answers": answer,
+        "pre_answers": pre_answer,
+        "nn_answers": nn_answer,
+        "pp_answers": pp_answer,
+        "sentence_spans": sentence_spans,
+        "true_sent_ids": cleaned_idx,
+        "mlm_ids": mlm_ids if if_add_lm else [],
+        "truncated": truncated,
+        "answer_statistics": (q_answer, p_answer, tot_answer,
+                              q_pre_answer, p_pre_answer, tot_pre_answer)
+    }
+
+
+def data2tensors(all_features: List[Dict], add_lm):
+    all_input_ids = torch.LongTensor(
+        [f["input_ids"] for f in all_features])
+    all_token_type_ids = torch.LongTensor(
+        [f["token_type_ids"] for f in all_features])
+    all_attention_mask = torch.LongTensor(
+        [f["attention_mask"] for f in all_features])
+
+    if add_lm:
+        all_mlm_ids = torch.LongTensor(
+            [f["mlm_ids"] for f in all_features]
+        )
+
+    max_sent_num = max(
+        map(lambda x: len(x['sentence_spans']), all_features))
+    max_q_sent_num = max(map(lambda x: len(x['answers']), all_features))
+
+    data_num = all_input_ids.size(0)
+    all_answers = torch.zeros(
+        (data_num, max_q_sent_num), dtype=torch.long).fill_(-1)
+    all_pre_answers = torch.zeros(
+        (data_num, max_q_sent_num), dtype=torch.long).fill_(-1)
+    all_nn_answers = torch.zeros(
+        (data_num, max_q_sent_num), dtype=torch.long).fill_(-1)
+    all_pp_answers = torch.zeros(
+        (data_num, max_q_sent_num), dtype=torch.long).fill_(-1)
+
+    for f_id, f in enumerate(all_features):
+        all_answers[f_id, :len(f["answers"])] = torch.LongTensor(
+            f["answers"])
+        all_pre_answers[f_id, :len(f["pre_answers"])] = torch.LongTensor(
+            f["pre_answers"])
+        all_nn_answers[f_id, :len(f["nn_answers"])] = torch.LongTensor(
+            f["nn_answers"])
+        all_pp_answers[f_id, :len(f["pp_answers"])] = torch.LongTensor(
+            f["pp_answers"])
+
+    all_sentence_spans = torch.zeros(
+        (all_input_ids.size(0), max_sent_num, 2), dtype=torch.long).fill_(-1)
+    for f_id, f in enumerate(all_features):
+        all_sentence_spans[f_id, :len(f['sentence_spans'])] = torch.LongTensor(
+            f['sentence_spans'])
+
+    all_true_sent_ids = torch.zeros((data_num, max_sent_num), dtype=torch.long).fill_(-1)
+    for f_id, f in enumerate(all_features):
+        all_true_sent_ids[f_id, :len(f["true_sent_ids"])] = torch.LongTensor(
+            f["true_sent_ids"]
+        )
+
+    all_feature_index = torch.arange(
+        all_input_ids.size(0), dtype=torch.long)
+
+    logger.info(f'input_ids size: {all_input_ids.size()}')
+    logger.info(f'token_type_ids size: {all_token_type_ids.size()}')
+    logger.info(f'attention_mask size: {all_attention_mask.size()}')
+    logger.info(f'sentence_spans size: {all_sentence_spans.size()}')
+    logger.info(f'answers size: {all_answers.size()}')
+    logger.info(f'pre_answers size: {all_pre_answers.size()}')
+    logger.info(f'nn_answers size: {all_nn_answers.size()}')
+    logger.info(f'pp_answers size: {all_pp_answers.size()}')
+    logger.info(f'all_true_sent_ids size: {all_true_sent_ids.size()}')
+    if add_lm:
+        logger.info(f'mlm_ids size: {all_mlm_ids.size()}')
+
+    if add_lm:
+        return all_input_ids, all_token_type_ids, all_attention_mask, all_sentence_spans, \
+            all_answers, all_pre_answers, all_nn_answers, all_pp_answers, all_mlm_ids, \
+            all_true_sent_ids, all_feature_index
+    else:
+        return all_input_ids, all_token_type_ids, all_attention_mask, all_sentence_spans, \
+            all_answers, all_pre_answers, all_nn_answers, all_pp_answers, \
+            all_true_sent_ids, all_feature_index
+
+
+def initializer(tokenizer_for_convert: PreTrainedTokenizer):
+    global tokenizer
+    tokenizer = tokenizer_for_convert
+
+
+if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input_file_list", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--tokenizer_name", type=str, required=True)
+    parser.add_argument("--add_lm", default=False, action='store_true')
+
+    parser.add_argument("--seed", type=int, default=42)
+
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
+    MAX_SEQ_LENGTH = 512
+    IF_ADD_LM = args.add_lm
+    # IF_BPE = True
+
+    cache_suffix = f'wiki_pre_train_ent_mp_{MAX_SEQ_LENGTH}_{IF_ADD_LM}'
+
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_name)
+
+    if isinstance(tokenizer, RobertaTokenizer):
+        IF_BPE = True
+    elif isinstance(tokenizer, BertTokenizer):
+        IF_BPE = False
+    else:
+        raise RuntimeError(tokenizer.__class__.__name__)
+
+    print(cache_suffix, IF_BPE)
+
+    # set_bucket_dir(args.output_dir)
+
+    input_file_list = json.load(open(args.input_file_list, "r"))
+    input_file_steps = {}
+    for input_file in input_file_list:
+
+        output_file_name = f'{input_file.split("/")[-1]}_{cache_suffix}'
+
+        logger.info(f"Reading data set from {input_file}...")
+
+        # input_file = '/data/volume2/' + input_file.split('/')[-1]
+
+        examples = json.load(open(input_file, "r", encoding="utf-8"))
+
+        unique_id = 100000
+
+        with Pool(os.cpu_count(), initializer=initializer, initargs=(tokenizer,)) as p:
+            annotate_ = partial(
+                process_example,
+                max_seq_length=MAX_SEQ_LENGTH,
+                if_add_lm=IF_ADD_LM,
+                if_bpe=IF_BPE
+            )
+            features = list(
+                tqdm(
+                    p.imap(annotate_, examples, chunksize=32),
+                    total=len(examples),
+                    desc="convert examples to features",
+                    disable=False,
+                )
+            )
+        
+        new_features = []
+        example_index = 0
+        for example_feature in tqdm(
+            features, total=len(features), desc="add example index and unique id",
+            disable=False
+        ):
+            if example_feature is None:
+                continue
+            example_feature["example_index"] = example_index
+            example_feature["unique_id"] = unique_id
+            example_index += 1
+            unique_id += 1
+            new_features.append(example_feature)
+        features = new_features
+
+        logger.info(f"Converting {len(features)} features.")
+        logger.info(f"Starting convert features to tensors.")
+        all_tensors = data2tensors(features, add_lm=IF_ADD_LM)
+
+        logger.info(f"Saving to oss...")
+        
+        # torch_save_to_oss((examples, all_tensors), output_file_name)
+        torch.save((examples, all_tensors), os.path.join(args.output_dir, output_file_name))
+
+        input_file_steps[input_file] = all_tensors[0].size(0)
+
+        del examples
+        del all_tensors
+
+        logger.info("Finished.")
+
+    steps_file_name = args.input_file_list[:-5] + '-' + cache_suffix + '-steps.json'
+    with open(os.path.join(args.output_dir, steps_file_name), 'w') as f:
+        json.dump(input_file_steps, f, indent=2)
