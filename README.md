@@ -138,3 +138,28 @@ The configs or bash scripts for specific tasks are also listed below.
 |  :-------       |  :------   |
 |  BERT-Q w. R/S          |  scripts/squad/iter_bert_qa_v1.sh    |
 |  RoBERTa-Q w. R/S       |  scripts/squad/iter_roberta_qa_v1.sh |
+
+
+### Citation
+
+Please kindly cite our paper if the work is helpful.
+
+```
+@inproceedings{Jiao21rept,
+  author    = {Fangkai Jiao and
+               Yangyang Guo and
+               Yilin Niu and
+               Feng Ji and
+               Feng{-}Lin Li and
+               Liqiang Nie},
+  title     = {{REPT:} Bridging Language Models and Machine Reading Comprehension
+               via Retrieval-Based Pre-training},
+  booktitle = {Findings of the Association for Computational Linguistics: {ACL/IJCNLP}},
+  series    = {Findings of {ACL}},
+  volume    = {{ACL/IJCNLP} 2021},
+  pages     = {150--163},
+  publisher = {{ACL}},
+  year      = {2021},
+  url       = {https://doi.org/10.18653/v1/2021.findings-acl.13},
+}
+```
