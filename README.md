@@ -1,5 +1,7 @@
 # REPT
 
+The pre-trained BERT and RoBERTa models can be downloaded from [here](https://drive.google.com/file/d/17ON33PBioseXMvM_mSunaUh9g-FhTJBC/view?usp=sharing).
+
 ## Pre-Training Setup
 ### Prepare Dataset for Pre-Training
 
